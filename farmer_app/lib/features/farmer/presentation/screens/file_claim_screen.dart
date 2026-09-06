@@ -85,12 +85,13 @@ class _FileClaimScreenState extends State<FileClaimScreen> {
 
     // Sync to backend Supabase database asynchronously
     ApiService().submitClaim(
-      farmerId: _appState.currentFarmer?.id ?? "FARMER_101",
-      farmerName: _appState.currentFarmer?.name ?? "Rajesh Kumar",
+      farmerId: _appState.activeFarmer.id,
+      farmerName: _appState.activeFarmer.name,
       damageReason: _selectedReason!,
       description: _descriptionController.text.trim(),
       photoUrls: photosList,
     );
+
 
     setState(() {
       _isSubmitting = false;

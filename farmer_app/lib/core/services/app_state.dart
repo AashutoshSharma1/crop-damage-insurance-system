@@ -49,6 +49,8 @@ class AppState extends ChangeNotifier {
 
   // Active Farmer Profile
   late FarmerModel activeFarmer;
+  FarmerModel get currentFarmer => activeFarmer;
+
 
   // Directory of Farmers for Field Officer Portal
   List<FarmerModel> registeredFarmers = [];
