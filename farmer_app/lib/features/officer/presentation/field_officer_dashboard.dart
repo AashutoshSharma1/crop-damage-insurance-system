@@ -4,6 +4,7 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import '../../../core/services/language_service.dart';
 import '../../../core/services/app_state.dart';
+import '../../../core/services/api_service.dart';
 import '../../../core/models/claim_model.dart';
 import '../../../core/models/farmer_model.dart';
 import 'officer_profile_screen.dart';
@@ -22,6 +23,59 @@ class _FieldOfficerDashboardState extends State<FieldOfficerDashboard> {
 
   // Filter Index: 0 = Total/All, 1 = Pending, 2 = Verified
   int _activeFilterIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadOfficerDashboardFromBackend();
+  }
+
+  Future<void> _loadOfficerDashboardFromBackend() async {
+    final data = await ApiService().fetchOfficerDashboard(_appState.officerId);
+    if (data != null && data['status'] == 'success') {
+      if (data['claims'] is List) {
+        final List claimsJson = data['claims'];
+        final List<ClaimModel> fetchedClaims = [];
+        for (var item in claimsJson) {
+          try {
+            final String id = item['id'] ?? 'CLM-2026';
+            final String fName = item['farmer_name'] ?? item['farmer'] ?? 'Farmer';
+            final String fId = item['farmer_id'] ?? item['farmerId'] ?? 'FARMER_101';
+            final String reason = item['damage_reason'] ?? item['reason'] ?? 'Damage';
+            final String desc = item['description'] ?? '';
+            final List photos = item['photo_urls'] ?? item['photoUrls'] ?? [];
+            final String statusStr = (item['status'] ?? 'submitted').toString().toLowerCase();
+
+            ClaimStatus status = ClaimStatus.submitted;
+            if (statusStr == 'verified') status = ClaimStatus.verified;
+            if (statusStr == 'approved') status = ClaimStatus.approved;
+            if (statusStr == 'rejected') status = ClaimStatus.rejected;
+
+            fetchedClaims.add(ClaimModel(
+              id: id,
+              farmerId: fId,
+              farmerName: fName,
+              damageReason: reason,
+              description: desc,
+              photoPaths: photos.map((e) => e.toString()).toList(),
+              dateSubmitted: DateTime.now(),
+              status: status,
+              officerNotes: item['officer_notes'] ?? item['officerNotes'],
+              estimatedPayout: (item['estimated_payout'] ?? item['estimatedPayout'] ?? 0.0).toDouble(),
+            ));
+          } catch (e) {
+            debugPrint("Error parsing claim item: $e");
+          }
+        }
+        if (fetchedClaims.isNotEmpty) {
+          setState(() {
+            _appState.claimsList = fetchedClaims;
+          });
+        }
+      }
+    }
+  }
+
 
   // Calculate remaining time for 72-hour deadline window
   Duration _getRemainingDeadline(DateTime submittedAt) {
