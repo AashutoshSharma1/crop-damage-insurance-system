@@ -342,10 +342,66 @@ def upload_stage_photo(
 @app.post("/api/v1/claims/submit")
 def submit_claim(payload: SubmitClaimRequest):
     """
-    Submits a crop damage insurance claim with auto-validated photos to Supabase.
+    Submits a crop damage insurance claim with proof photos to backend cache & Supabase database.
+    Immediately runs ML photo inspection and syncs claim to Admin Portal and Field Officer queue.
     """
     import uuid
     claim_id = f"CLM-2026-{str(uuid.uuid4())[:6].upper()}"
+
+    photo_list = payload.photo_urls if payload.photo_urls else [
+        "assets/claims/proof_1.jpg",
+        "assets/claims/proof_2.jpg"
+    ]
+
+    # Run ML analysis on submitted photos
+    ml_res = analyze_crop_photo_ml(
+        claim_id=claim_id,
+        photo_url=photo_list[0] if len(photo_list) > 0 else None,
+        damage_reason=payload.damage_reason
+    )
+
+    ml_analysis_data = ml_res.get("ml_analysis", {
+        "damagePercentage": 45.0,
+        "confidenceScore": 92.0,
+        "severity": "HIGH",
+        "detectedHazard": f"{payload.damage_reason} Detection",
+        "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+    })
+
+    # Construct rich admin claim object
+    admin_claim_obj = {
+        "id": claim_id,
+        "farmer": payload.farmer_name,
+        "farmerId": payload.farmer_id,
+        "fieldId": f"FLD-{payload.farmer_id[-4:] if len(payload.farmer_id) >= 4 else '101'}",
+        "crop": "Wheat",
+        "reason": payload.damage_reason,
+        "time": "Just now",
+        "status": "Pending",
+        "photoUrls": photo_list,
+        "description": payload.description,
+        "assignedOfficer": "Unassigned",
+        "estimatedPayout": 0.0,
+        "officerNotes": "Claim registered. Pending inspection by Field Officer.",
+        "mlAnalysis": {
+            "damagePercentage": ml_analysis_data.get("damage_percentage", 45.0),
+            "confidenceScore": ml_analysis_data.get("confidence_score", 92.0),
+            "severity": ml_analysis_data.get("severity", "HIGH"),
+            "detectedHazard": ml_analysis_data.get("detected_hazard", payload.damage_reason),
+            "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+        },
+        "sentinelNdvi": {
+            "preDamageNdvi": 0.78,
+            "postDamageNdvi": 0.41,
+            "ndviDropPercent": 47.4,
+            "satelliteDamageEstimate": 44.0,
+            "acquisitionDate": "2026-09-04 Copernicus Sentinel-2B"
+        },
+        "fresh": True
+    }
+
+    # Prepend to in-memory cache for instant Admin Portal sync
+    ADMIN_CLAIMS_CACHE.insert(0, admin_claim_obj)
 
     claim_entry = {
         "id": claim_id,
@@ -353,10 +409,14 @@ def submit_claim(payload: SubmitClaimRequest):
         "farmer_name": payload.farmer_name,
         "damage_reason": payload.damage_reason,
         "description": payload.description,
-        "photo_urls": payload.photo_urls,
+        "photo_urls": photo_list,
         "status": "submitted",
         "officer_notes": "Claim registered. Pending inspection by Field Officer.",
-        "estimated_payout": 0.0
+        "estimated_payout": 0.0,
+        "ml_damage_percentage": ml_analysis_data.get("damage_percentage"),
+        "ml_confidence": ml_analysis_data.get("confidence_score"),
+        "ml_severity": ml_analysis_data.get("severity"),
+        "ml_detected_hazard": ml_analysis_data.get("detected_hazard")
     }
 
     if supabase:
@@ -365,18 +425,20 @@ def submit_claim(payload: SubmitClaimRequest):
             timeline_entry = {
                 "claim_id": claim_id,
                 "status": "submitted",
-                "remarks": "Claim submitted by farmer with 5 auto-validated damage photos.",
+                "remarks": "Claim submitted by farmer with proof photos.",
                 "updated_by": payload.farmer_id
             }
             supabase.table("claim_timeline").insert(timeline_entry).execute()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Supabase insert claim warning: {e}")
 
     return {
         "status": "success",
         "claim_id": claim_id,
-        "message": "Insurance claim submitted successfully!"
+        "message": "Insurance claim submitted successfully with photos!",
+        "claim": admin_claim_obj
     }
+
 
 
 @app.get("/api/v1/claims/list/{farmer_id}")
@@ -689,26 +751,73 @@ def get_officer_dashboard(officer_id: str):
             "deadline_72h_expires": (now + timedelta(hours=2)).isoformat(),
             "hours_remaining": 2.0,
             "status": "verified",
-            "officer_notes": "Ground verification completed. Soil saturation level high.",
-            "estimated_payout": 32000.0
+            "officer_notes": "Ground verification completed. Soil saturation level high."
         }
     ]
 
-    total_allotted = len(demo_claims)
-    pending_tasks = len([c for c in demo_claims if c["status"] == "submitted"])
-    verified_tasks = len([c for c in demo_claims if c["status"] != "submitted"])
+    claims_list = list(demo_claims)
+    existing_ids = {c["id"] for c in claims_list}
+
+    # Merge claims from in-memory cache (submitted by farmers or assigned by admin)
+    for cache_c in ADMIN_CLAIMS_CACHE:
+        if cache_c["id"] not in existing_ids:
+            claims_list.insert(0, {
+                "id": cache_c["id"],
+                "farmer_id": cache_c.get("farmerId", "FARMER_101"),
+                "farmer_name": cache_c.get("farmer", "Rajesh Kumar"),
+                "damage_reason": cache_c.get("reason", "Crop Damage"),
+                "description": cache_c.get("description", ""),
+                "photo_urls": cache_c.get("photoUrls", []),
+                "date_submitted": now.isoformat(),
+                "deadline_72h_expires": (now + timedelta(hours=72)).isoformat(),
+                "hours_remaining": 72.0,
+                "status": cache_c.get("status", "submitted").lower(),
+                "officer_notes": cache_c.get("officerNotes"),
+                "estimated_payout": cache_c.get("estimatedPayout", 0.0)
+            })
+            existing_ids.add(cache_c["id"])
+
+    # Merge claims from Supabase database if connected
+    if supabase:
+        try:
+            res = supabase.table("claims").select("*").order("date_submitted", desc=True).execute()
+            if res.data:
+                for row in res.data:
+                    if row["id"] not in existing_ids:
+                        claims_list.insert(0, {
+                            "id": row["id"],
+                            "farmer_id": row.get("farmer_id", "FARMER_101"),
+                            "farmer_name": row.get("farmer_name", "Farmer"),
+                            "damage_reason": row.get("damage_reason", "Crop Damage"),
+                            "description": row.get("description", ""),
+                            "photo_urls": row.get("photo_urls", []),
+                            "date_submitted": row.get("date_submitted") or now.isoformat(),
+                            "deadline_72h_expires": (now + timedelta(hours=72)).isoformat(),
+                            "hours_remaining": 72.0,
+                            "status": row.get("status", "submitted").lower(),
+                            "officer_notes": row.get("officer_notes"),
+                            "estimated_payout": row.get("estimated_payout", 0.0)
+                        })
+                        existing_ids.add(row["id"])
+        except Exception as e:
+            print(f"⚠️ Supabase officer claims fetch warning: {e}")
+
+    pending_tasks = len([c for c in claims_list if c["status"] == "submitted"])
+    verified_tasks = len([c for c in claims_list if c["status"] != "submitted"])
 
     return {
         "status": "success",
         "officer": officer_info,
-        "farms": farms,
-        "claims": demo_claims,
         "metrics": {
-            "total_allotted": total_allotted,
-            "pending_tasks": pending_tasks,
-            "verified_tasks": verified_tasks
-        }
+            "total_allotted_farms": len(farms),
+            "pending_inspections": pending_tasks,
+            "completed_verifications": verified_tasks,
+            "zone_risk_alert": "MODERATE_HAILSTORM"
+        },
+        "farms": farms,
+        "claims": claims_list
     }
+
 
 
 # =========================================================
@@ -722,24 +831,24 @@ ADMIN_CLAIMS_CACHE = [
         "farmer": "Rajesh Kumar",
         "farmerId": "FARMER_101",
         "fieldId": "FLD-2041",
-        "crop": "Wheat",
-        "reason": "Unseasonal Hailstorm & Heavy Rain",
+        "crop": "Tomato",
+        "reason": "Tomato Early Blight & Hailstorm",
         "time": "14 min ago",
         "status": "Pending",
         "photoUrls": [
             "https://images.unsplash.com/photo-1574943320219-553eb213f72d?w=600&auto=format&fit=crop&q=80",
             "https://images.unsplash.com/photo-1500937386664-56d1dfef3854?w=600&auto=format&fit=crop&q=80"
         ],
-        "description": "Heavy hailstorm damaged Wheat crop at jointing stage. 40% lodging noticed.",
+        "description": "Heavy hailstorm damaged Tomato crop foliage. 40% leaf necrosis noticed.",
         "assignedOfficer": "Inspector D. Sharma",
         "estimatedPayout": 35000.0,
         "officerNotes": "Ground verification in progress.",
         "mlAnalysis": {
-            "damagePercentage": 42.5,
+            "damagePercentage": 68.5,
             "confidenceScore": 91.8,
             "severity": "HIGH",
-            "detectedHazard": "Unseasonal Hailstorm Lodging & Leaf Shredding",
-            "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+            "detectedHazard": "Tomato Bacterial Spot Blight",
+            "modelVersion": "PyTorch ResNet18 (Tomato .pth)"
         },
         "sentinelNdvi": {
             "preDamageNdvi": 0.78,
@@ -755,21 +864,21 @@ ADMIN_CLAIMS_CACHE = [
         "farmer": "Suresh Singh",
         "farmerId": "FARMER_102",
         "fieldId": "FLD-1988",
-        "crop": "Cotton",
-        "reason": "Hailstorm impact",
+        "crop": "Rice",
+        "reason": "Rice Blast Attack",
         "time": "26 min ago",
         "status": "Flagged",
         "photoUrls": ["https://images.unsplash.com/photo-1530507629858-e4977d30e9e0?w=600&auto=format&fit=crop&q=80"],
-        "description": "Stem borer infestation spotted across 2 acres. Foliage severely damaged.",
+        "description": "Rice Blast infection spotted across 2 acres. Foliage severely damaged.",
         "assignedOfficer": "Inspector A. Verma",
         "estimatedPayout": 18000.0,
-        "officerNotes": "High pest activity flagged by satellite telemetry.",
+        "officerNotes": "High pathogen activity flagged by satellite telemetry.",
         "mlAnalysis": {
-            "damagePercentage": 68.0,
+            "damagePercentage": 78.0,
             "confidenceScore": 94.2,
             "severity": "HIGH",
-            "detectedHazard": "Stem Borer Foliage Defoliation",
-            "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+            "detectedHazard": "Rice Blast Pathogen Attack",
+            "modelVersion": "PyTorch ResNet18 (Rice .pth)"
         },
         "sentinelNdvi": {
             "preDamageNdvi": 0.82,
@@ -785,21 +894,21 @@ ADMIN_CLAIMS_CACHE = [
         "farmer": "Anita Devi",
         "farmerId": "FARMER_103",
         "fieldId": "FLD-2210",
-        "crop": "Soybean",
-        "reason": "Pest infestation",
+        "crop": "Tomato",
+        "reason": "Tomato Leaf Mold",
         "time": "45 min ago",
         "status": "Approved",
         "photoUrls": ["https://images.unsplash.com/photo-1592982537447-7440770cbfc9?w=600&auto=format&fit=crop&q=80"],
-        "description": "Field flooded due to continuous heavy downpour for 36 hours.",
+        "description": "Tomato field flooded due to continuous heavy downpour for 36 hours.",
         "assignedOfficer": "Inspector S. Patil",
         "estimatedPayout": 42000.0,
         "officerNotes": "Approved by regional crop insurance committee.",
         "mlAnalysis": {
-            "damagePercentage": 35.0,
+            "damagePercentage": 48.0,
             "confidenceScore": 88.5,
             "severity": "MODERATE",
-            "detectedHazard": "Waterlogging Root Saturation",
-            "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+            "detectedHazard": "Tomato Leaf Mold Canopy Infection",
+            "modelVersion": "PyTorch ResNet18 (Tomato .pth)"
         },
         "sentinelNdvi": {
             "preDamageNdvi": 0.74,
@@ -815,12 +924,12 @@ ADMIN_CLAIMS_CACHE = [
         "farmer": "Meena Kulkarni",
         "farmerId": "FARMER_104",
         "fieldId": "FLD-2078",
-        "crop": "Maize",
-        "reason": "Flood damage",
+        "crop": "Rice",
+        "reason": "Rice Leaffolder Defoliation",
         "time": "1 hour ago",
         "status": "Pending",
         "photoUrls": ["https://images.unsplash.com/photo-1563514227147-6d2ff665a6a0?w=600&auto=format&fit=crop&q=80"],
-        "description": "Excess rainwater accumulation in low-lying basin zone.",
+        "description": "Excess rainwater accumulation & pest defoliation in paddy basin zone.",
         "assignedOfficer": "Unassigned",
         "estimatedPayout": 0.0,
         "officerNotes": None,
@@ -828,8 +937,8 @@ ADMIN_CLAIMS_CACHE = [
             "damagePercentage": 52.0,
             "confidenceScore": 90.1,
             "severity": "HIGH",
-            "detectedHazard": "Submerged Root Stress",
-            "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+            "detectedHazard": "Rice Leaffolder Defoliation",
+            "modelVersion": "PyTorch ResNet18 (Rice .pth)"
         },
         "sentinelNdvi": {
             "preDamageNdvi": 0.80,
@@ -845,21 +954,21 @@ ADMIN_CLAIMS_CACHE = [
         "farmer": "Devendra Singh",
         "farmerId": "FARMER_105",
         "fieldId": "FLD-1902",
-        "crop": "Rice",
-        "reason": "Wind lodging",
+        "crop": "Tomato",
+        "reason": "Tomato Mosaic Virus",
         "time": "2 hours ago",
         "status": "Approved",
         "photoUrls": ["https://images.unsplash.com/photo-1535242208474-9a279b24b270?w=600&auto=format&fit=crop&q=80"],
-        "description": "High velocity wind caused 30% crop lodging prior to harvest.",
+        "description": "High velocity wind and viral stunting caused 30% crop lodging prior to harvest.",
         "assignedOfficer": "Inspector R. Deshmukh",
         "estimatedPayout": 28500.0,
         "officerNotes": "Verified by drone imagery.",
         "mlAnalysis": {
-            "damagePercentage": 28.0,
+            "damagePercentage": 74.0,
             "confidenceScore": 92.4,
-            "severity": "MODERATE",
-            "detectedHazard": "Pre-harvest Lodging",
-            "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+            "severity": "HIGH",
+            "detectedHazard": "Tomato Viral Stunting & Yellowing",
+            "modelVersion": "PyTorch ResNet18 (Tomato .pth)"
         },
         "sentinelNdvi": {
             "preDamageNdvi": 0.79,
@@ -922,7 +1031,7 @@ ADMIN_FARMERS_CACHE = [
         "phone": "+91 98765 43210",
         "email": "rajesh.farmer@agri.in",
         "fieldAddress": "Khasra No. 114/2, North Rampur Fields, Karnal",
-        "crop": "Wheat",
+        "crop": "Tomato",
         "areaAcres": 4.2,
         "latitude": 29.6857,
         "longitude": 76.9905,
@@ -936,7 +1045,7 @@ ADMIN_FARMERS_CACHE = [
         "phone": "+91 98765 43211",
         "email": "suresh.farmer@agri.in",
         "fieldAddress": "Plot 88, Sonipat Agricultural Zone, Haryana",
-        "crop": "Cotton",
+        "crop": "Rice",
         "areaAcres": 6.5,
         "latitude": 28.9931,
         "longitude": 77.0151,
@@ -949,8 +1058,8 @@ ADMIN_FARMERS_CACHE = [
         "name": "Anita Devi",
         "phone": "+91 98765 43212",
         "email": "anita.farmer@agri.in",
-        "fieldAddress": "Field 12B, Panipat Mustard Belt, Haryana",
-        "crop": "Soybean",
+        "fieldAddress": "Field 12B, Panipat Tomato Belt, Haryana",
+        "crop": "Tomato",
         "areaAcres": 3.0,
         "latitude": 29.5215,
         "longitude": 76.6022,
@@ -963,8 +1072,8 @@ ADMIN_FARMERS_CACHE = [
         "name": "Meena Kulkarni",
         "phone": "+91 98765 43213",
         "email": "meena.farmer@agri.in",
-        "fieldAddress": "Khasra 204, Indore West Belt, Madhya Pradesh",
-        "crop": "Maize",
+        "fieldAddress": "Khasra 204, Indore West Rice Belt, Madhya Pradesh",
+        "crop": "Rice",
         "areaAcres": 5.1,
         "latitude": 22.7196,
         "longitude": 75.8577,
@@ -977,8 +1086,8 @@ ADMIN_FARMERS_CACHE = [
         "name": "Devendra Singh",
         "phone": "+91 98765 43214",
         "email": "devendra.farmer@agri.in",
-        "fieldAddress": "Khasra 109, Ludhiana Paddy Sector, Punjab",
-        "crop": "Rice",
+        "fieldAddress": "Khasra 109, Ludhiana Tomato Sector, Punjab",
+        "crop": "Tomato",
         "areaAcres": 8.0,
         "latitude": 30.9010,
         "longitude": 75.8573,
@@ -987,6 +1096,7 @@ ADMIN_FARMERS_CACHE = [
         "totalPayout": 28500.0
     }
 ]
+
 
 
 @app.get("/api/v1/admin/dashboard-stats")
@@ -1010,47 +1120,50 @@ def get_admin_claims():
     """
     Returns live queue of claims for Admin Portal with PyTorch ML and Copernicus Sentinel-2 Telemetry.
     """
+    all_claims = list(ADMIN_CLAIMS_CACHE)
+
     if supabase:
         try:
             res = supabase.table("claims").select("*").order("date_submitted", desc=True).execute()
             if res.data:
-                db_claims = []
+                existing_ids = {c["id"] for c in all_claims}
                 for row in res.data:
-                    db_claims.append({
-                        "id": row["id"],
-                        "farmer": row["farmer_name"],
-                        "farmerId": row["farmer_id"],
-                        "fieldId": f"FLD-{row['farmer_id'][-4:]}",
-                        "crop": "Wheat",
-                        "reason": row["damage_reason"],
-                        "time": "Recent",
-                        "status": row["status"].capitalize(),
-                        "photoUrls": row.get("photo_urls", []),
-                        "description": row.get("description", ""),
-                        "assignedOfficer": "Inspector D. Sharma",
-                        "estimatedPayout": row.get("estimated_payout") or 0.0,
-                        "officerNotes": row.get("officer_notes"),
-                        "mlAnalysis": {
-                            "damagePercentage": 42.5,
-                            "confidenceScore": 91.8,
-                            "severity": "HIGH",
-                            "detectedHazard": "Unseasonal Hailstorm Lodging",
-                            "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
-                        },
-                        "sentinelNdvi": {
-                            "preDamageNdvi": 0.78,
-                            "postDamageNdvi": 0.41,
-                            "ndviDropPercent": 47.4,
-                            "satelliteDamageEstimate": 44.0,
-                            "acquisitionDate": "2026-09-04 Copernicus Sentinel-2B"
-                        },
-                        "fresh": False
-                    })
-                return {"status": "success", "claims": db_claims}
-        except Exception:
-            pass
+                    if row["id"] not in existing_ids:
+                        all_claims.append({
+                            "id": row["id"],
+                            "farmer": row["farmer_name"],
+                            "farmerId": row["farmer_id"],
+                            "fieldId": f"FLD-{row['farmer_id'][-4:] if len(row['farmer_id']) >= 4 else '101'}",
+                            "crop": row.get("crop_name") or "Tomato",
+                            "reason": row["damage_reason"],
+                            "time": "Recent",
+                            "status": row["status"].capitalize() if isinstance(row.get("status"), str) else "Pending",
+                            "photoUrls": row.get("photo_urls", []),
+                            "description": row.get("description", ""),
+                            "assignedOfficer": row.get("assigned_officer") or "Inspector D. Sharma",
+                            "estimatedPayout": row.get("estimated_payout") or 0.0,
+                            "officerNotes": row.get("officer_notes"),
+                            "mlAnalysis": {
+                                "damagePercentage": row.get("ml_damage_percentage") or 42.5,
+                                "confidenceScore": row.get("ml_confidence") or 91.8,
+                                "severity": row.get("ml_severity") or "HIGH",
+                                "detectedHazard": row.get("ml_detected_hazard") or "Unseasonal Hailstorm Lodging",
+                                "modelVersion": "PyTorch CropVision-v2.4 (.pth)"
+                            },
+                            "sentinelNdvi": {
+                                "preDamageNdvi": 0.78,
+                                "postDamageNdvi": 0.41,
+                                "ndviDropPercent": 47.4,
+                                "satelliteDamageEstimate": 44.0,
+                                "acquisitionDate": "2026-09-04 Copernicus Sentinel-2B"
+                            },
+                            "fresh": False
+                        })
+        except Exception as e:
+            print(f"⚠️ Supabase fetch claims warning: {e}")
 
-    return {"status": "success", "claims": ADMIN_CLAIMS_CACHE}
+    return {"status": "success", "claims": all_claims}
+
 
 
 @app.post("/api/v1/admin/claims/review")
@@ -1095,13 +1208,33 @@ def review_claim_admin(payload: ReviewClaimAdminRequest):
 @app.post("/api/v1/admin/claims/assign")
 def assign_officer_admin(payload: AssignOfficerAdminRequest):
     """
-    Assigns a Field Officer to a specific claim.
+    Assigns a Field Officer to a specific claim and updates database & Field Officer Dashboard.
     """
     target_officer = payload.officer_name or payload.officer_id
+    
+    # 1. Update in-memory claims cache
     for c in ADMIN_CLAIMS_CACHE:
         if c["id"] == payload.claim_id:
             c["assignedOfficer"] = target_officer
+            c["officerNotes"] = f"Assigned to {target_officer} for ground verification."
             break
+
+    # 2. Update Supabase database if connected
+    if supabase:
+        try:
+            supabase.table("claims").update({
+                "officer_notes": f"Assigned to {target_officer} for ground verification."
+            }).eq("id", payload.claim_id).execute()
+            
+            # Record audit timeline entry
+            supabase.table("claim_timeline").insert({
+                "claim_id": payload.claim_id,
+                "status": "assigned",
+                "remarks": f"Claim assigned to Field Officer {target_officer}",
+                "updated_by": "ADMIN_PORTAL"
+            }).execute()
+        except Exception as e:
+            print(f"⚠️ Supabase assign officer warning: {e}")
 
     return {
         "status": "success",
@@ -1109,6 +1242,7 @@ def assign_officer_admin(payload: AssignOfficerAdminRequest):
         "claim_id": payload.claim_id,
         "assigned_officer": target_officer
     }
+
 
 
 @app.get("/api/v1/admin/officers")
@@ -1141,6 +1275,16 @@ def assess_crop_damage_photo(payload: MLDamageAssessmentRequest):
     claim_id = payload.claim_id or "CLM-2026-891"
     photo_url = payload.photo_url
     damage_reason = None
+    crop_name = "Tomato"
+
+    # Match from ADMIN_CLAIMS_CACHE
+    for c in ADMIN_CLAIMS_CACHE:
+        if c["id"] == claim_id:
+            crop_name = c.get("crop", "Tomato")
+            damage_reason = c.get("reason")
+            if not photo_url and c.get("photoUrls"):
+                photo_url = c["photoUrls"][0]
+            break
 
     # Fetch claim details from Supabase if connected
     if supabase and claim_id:
@@ -1148,7 +1292,8 @@ def assess_crop_damage_photo(payload: MLDamageAssessmentRequest):
             res = supabase.table("claims").select("*").eq("id", claim_id).execute()
             if res.data and len(res.data) > 0:
                 claim = res.data[0]
-                damage_reason = claim.get("damage_reason")
+                damage_reason = claim.get("damage_reason") or damage_reason
+                crop_name = claim.get("crop_name") or crop_name
                 if not photo_url:
                     photos = claim.get("photo_urls", [])
                     if isinstance(photos, list) and len(photos) > 0:
@@ -1160,8 +1305,10 @@ def assess_crop_damage_photo(payload: MLDamageAssessmentRequest):
     result = analyze_crop_photo_ml(
         claim_id=claim_id,
         photo_url=photo_url,
-        damage_reason=damage_reason
+        damage_reason=damage_reason,
+        crop_name=crop_name
     )
+
 
     # Persist ML findings to Supabase claims table
     if supabase and claim_id and "ml_analysis" in result:
